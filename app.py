@@ -155,11 +155,18 @@ if uploaded_files:
                 st.warning("No transactions in the selected date range.")
                 st.stop()
 
-        # Month filter
-        available_months = sorted(full_df['Month_Year'].astype(str).unique(), reverse=True)
-        selected_month = st.selectbox("Filter by month", ["All"] + available_months)
+        # Filters
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            available_months = sorted(full_df['Month_Year'].astype(str).unique(), reverse=True)
+            selected_month = st.selectbox("Filter by month", ["All"] + available_months)
+        with col_f2:
+            store_filter = st.text_input("Filter by store", placeholder="e.g. ליברה")
+
         if selected_month != "All":
             full_df = full_df[full_df['Month_Year'].astype(str) == selected_month]
+        if store_filter:
+            full_df = full_df[full_df['Merchant'].str.contains(store_filter, case=False, na=False)]
 
         # ==========================================
         # TABS
