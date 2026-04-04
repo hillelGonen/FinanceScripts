@@ -115,6 +115,33 @@ with st.sidebar:
             st.error(f"Invalid JSON: {err}")
 
     st.markdown("---")
+
+    # Categorize a store
+    st.subheader("Categorize a Store")
+    store_name = st.text_input("Store name (keyword)", placeholder="e.g. ליברה")
+    existing_categories = [c for c in mapping.keys() if c != "Uncategorized"]
+    cat_options = existing_categories + ["+ New category"]
+    selected_cat = st.selectbox("Assign to category", cat_options)
+    if selected_cat == "+ New category":
+        selected_cat = st.text_input("New category name")
+    if st.button("Save Store") and store_name and selected_cat:
+        try:
+            with open('categories.json', 'r', encoding='utf-8') as f:
+                cat_data = json.load(f)
+        except FileNotFoundError:
+            cat_data = {**DEFAULT_CATEGORY_MAPPING}
+        if selected_cat not in cat_data:
+            cat_data[selected_cat] = []
+        if store_name not in cat_data[selected_cat]:
+            cat_data[selected_cat].append(store_name)
+        ok, err = save_categories_json(json.dumps(cat_data, ensure_ascii=False, indent=2))
+        if ok:
+            st.success(f'"{store_name}" added to "{selected_cat}"')
+            load_category_mapping.clear()
+        else:
+            st.error(f"Error: {err}")
+
+    st.markdown("---")
     st.info('Add a `"budgets"` key to set monthly limits per category.\n\nExample:\n```json\n"budgets": {\n  "Groceries": 2000\n}\n```')
 
 class NamedBytesIO(io.BytesIO):
