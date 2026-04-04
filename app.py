@@ -23,6 +23,23 @@ from core.excel import generate_excel_bytes
 # Page setup (must be first Streamlit call)
 st.set_page_config(page_title="Personal Budget Analyzer", page_icon="💰", layout="wide")
 
+# Password protection
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if not st.session_state.authenticated:
+        st.title("Login")
+        password = st.text_input("Password", type="password")
+        if st.button("Enter"):
+            if password == st.secrets["APP_PASSWORD"]:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Wrong password")
+        st.stop()
+
+check_password()
+
 warnings.filterwarnings('ignore')
 
 
