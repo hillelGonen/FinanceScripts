@@ -1,177 +1,59 @@
-import streamlit as st
-import pandas as pd
-import json
 import io
-import os
+import json
 import warnings
-from openpyxl.styles import PatternFill, Border, Side, Alignment, Font
-from openpyxl.utils import get_column_letter
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
 from datetime import datetime
 
-# Page setup (Must be the first line)
+from core.categories import (
+    DEFAULT_CATEGORY_MAPPING,
+    classify_expense,
+    load_category_mapping as _load_category_mapping,
+    load_budgets,
+    save_categories_json,
+)
+from core.transactions import (
+    _parse_excel_dataframe,
+    deduplicate_transactions,
+)
+from core.excel import generate_excel_bytes
+
+# Page setup (must be first Streamlit call)
 st.set_page_config(page_title="Personal Budget Analyzer", page_icon="💰", layout="wide")
 
-# Silence warnings
 warnings.filterwarnings('ignore')
 
+
 # ==========================================
-# 1. Logic & Helpers
+# App-level wrappers
 # ==========================================
 
-DEFAULT_CATEGORY_MAPPING = {
-    "Groceries & Supermarket": ["רמי לוי", "שופרסל", "AM:PM"],
-    "Uncategorized": []
-}
-
-
-@st.cache_data  # Cache data to avoid reloading on every interaction
+@st.cache_data
 def load_category_mapping():
-    try:
-        if os.path.exists('categories.json'):
-            with open('categories.json', 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return DEFAULT_CATEGORY_MAPPING
-
-
-def classify_expense(merchant_name, mapping):
-    if not isinstance(merchant_name, str):
-        return "Uncategorized"
-    merchant_upper = merchant_name.upper()
-    for category, keywords in mapping.items():
-        for keyword in keywords:
-            if keyword.upper() in merchant_upper:
-                return category
-    return "Uncategorized"
-
-
-def clean_dates(date_series):
-    date_series = date_series.astype(str).str.strip()
-    date_series = date_series.str.replace('.', '-', regex=False)
-    date_series = date_series.str.replace('/', '-', regex=False)
-    return pd.to_datetime(date_series, dayfirst=True, errors='coerce')
+    return _load_category_mapping()
 
 
 def read_excel_file(uploaded_file):
-    """
-    Streamlit-adapted function that accepts a file object instead of a path.
-    """
     try:
-        # Initial read to detect the header row
         preview = pd.read_excel(uploaded_file, header=None, nrows=30)
-
         header_row = 0
         for i, row in preview.iterrows():
             row_str = row.astype(str).str.cat(sep=' ')
-            # Keep Hebrew keywords here to match the input files
             if "תאריך" in row_str and ("רכישה" in row_str or "עסקה" in row_str):
                 header_row = i
                 break
-
-        # Reset file pointer to the beginning to read again
         uploaded_file.seek(0)
         df = pd.read_excel(uploaded_file, skiprows=header_row)
-        df.columns = df.columns.str.strip()
-
-        # Dynamic column detection (Hebrew headers)
-        merchant_col = next((c for c in ['שם בית עסק', 'שם בית העסק'] if c in df.columns), None)
-        amount_col = 'סכום חיוב' if 'סכום חיוב' in df.columns else None
-        date_col = next((c for c in ['תאריך רכישה', 'תאריך עסקה', 'תאריך'] if c in df.columns), None)
-
-        if not merchant_col or not amount_col:
-            return None
-
-        temp_df = pd.DataFrame()
-        temp_df['Date'] = clean_dates(df[date_col]) if date_col else pd.NaT
-        temp_df['Merchant'] = df[merchant_col]
-        temp_df['Amount'] = df[amount_col]
-        temp_df['Source_File'] = uploaded_file.name
-
-        # Clean summary rows
-        summary_phrases = ['TOTAL FOR DATE', 'סה"כ לחיוב', 'סה"כ', 'סך הכל']
-        mask = ~temp_df['Merchant'].astype(str).str.contains('|'.join(summary_phrases), regex=True, na=False)
-        temp_df = temp_df[mask]
-
-        temp_df = temp_df.dropna(subset=['Amount'])
-        temp_df['Amount'] = temp_df['Amount'].astype(str).str.replace(r'[₪,]', '', regex=True).str.strip()
-        temp_df['Amount'] = pd.to_numeric(temp_df['Amount'], errors='coerce')
-        temp_df = temp_df.dropna(subset=['Amount'])
-
-        return temp_df
-
+        return _parse_excel_dataframe(df, uploaded_file.name)
     except Exception as e:
         st.error(f"Error reading file {uploaded_file.name}: {e}")
         return None
 
 
 # ==========================================
-# 2. Excel Generation Logic (Memory Buffer)
-# ==========================================
-
-def format_excel_sheet(worksheet):
-    # Styles
-    header_fill = PatternFill(start_color="D9E1F2", fill_type="solid")
-    total_col_fill = PatternFill(start_color="FFF2CC", fill_type="solid")
-    grand_total_fill = PatternFill(start_color="E2EFDA", fill_type="solid")
-    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                         top=Side(style='thin'), bottom=Side(style='thin'))
-    bold_font = Font(bold=True)
-
-    # Freeze panes (Row 1 and Column A)
-    worksheet.freeze_panes = 'B2'
-
-    max_row = worksheet.max_row
-    max_col = worksheet.max_column
-
-    for row in worksheet.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-        for cell in row:
-            cell.border = thin_border
-            if isinstance(cell.value, (int, float)):
-                cell.number_format = '#,##0.00 "₪"'
-
-            if cell.row == 1:
-                cell.fill = header_fill
-                cell.font = bold_font
-                cell.alignment = Alignment(horizontal='center')
-            elif cell.row == max_row:
-                cell.fill = grand_total_fill
-                cell.font = bold_font
-            elif cell.column == max_col:
-                cell.fill = total_col_fill
-                cell.font = bold_font
-
-    # Auto-fit column widths
-    for column in worksheet.columns:
-        max_length = 0
-        column_letter = get_column_letter(column[0].column)
-        for cell in column:
-            try:
-                if cell.value:
-                    cell_len = len(str(cell.value))
-                    if cell_len > max_length:
-                        max_length = cell_len
-            except:
-                pass
-        worksheet.column_dimensions[column_letter].width = (max_length + 2) * 1.2
-
-
-def generate_excel_bytes(full_df, pivot_table):
-    """Generates the Excel file in memory (BytesIO) for download."""
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        full_df.to_excel(writer, sheet_name='Transactions', index=False)
-        format_excel_sheet(writer.sheets['Transactions'])
-
-        pivot_table.to_excel(writer, sheet_name='Summary')
-        format_excel_sheet(writer.sheets['Summary'])
-
-    output.seek(0)
-    return output
-
-
-# ==========================================
-# 3. User Interface (Streamlit UI)
+# User Interface
 # ==========================================
 
 st.title("📊 Smart Expense Analysis")
@@ -183,11 +65,65 @@ with st.sidebar:
     mapping = load_category_mapping()
     st.success(f"Loaded {len(mapping)} categories from JSON")
     st.markdown("---")
-    st.info("Tip: Ensure 'categories.json' is in the same folder.")
 
-# Step 1: File Upload
-uploaded_files = st.file_uploader("Upload Excel files (Multi-select supported)", type=['xlsx', 'xls'],
-                                  accept_multiple_files=True)
+    # Date Range Filter
+    st.subheader("Date Filter")
+    date_filter_enabled = st.checkbox("Filter by date range")
+    date_from = None
+    date_to = None
+    if date_filter_enabled:
+        date_from = st.date_input("From", value=None)
+        date_to = st.date_input("To", value=None)
+
+    st.markdown("---")
+
+    # Categories JSON Editor
+    st.subheader("Edit Categories")
+    try:
+        with open('categories.json', 'r', encoding='utf-8') as f:
+            current_json = f.read()
+    except FileNotFoundError:
+        current_json = json.dumps(
+            {**DEFAULT_CATEGORY_MAPPING, "budgets": {"Groceries & Supermarket": 2000}},
+            ensure_ascii=False, indent=2
+        )
+
+    edited_json = st.text_area("categories.json", value=current_json, height=300)
+    if st.button("Save Categories"):
+        ok, err = save_categories_json(edited_json)
+        if ok:
+            st.success("Saved! Reload the page to apply.")
+            load_category_mapping.clear()
+        else:
+            st.error(f"Invalid JSON: {err}")
+
+    st.markdown("---")
+    st.info('Add a `"budgets"` key to set monthly limits per category.\n\nExample:\n```json\n"budgets": {\n  "Groceries": 2000\n}\n```')
+
+class NamedBytesIO(io.BytesIO):
+    def __init__(self, data, name):
+        super().__init__(data)
+        self.name = name
+
+
+REPORTS_FOLDER = Path(__file__).parent / "Cash_Reports"
+
+# File source selection
+source = st.radio("Load files from", ["Folder (Cash_Reports)", "Manual upload"], horizontal=True)
+
+if source == "Folder (Cash_Reports)":
+    folder_files = sorted(REPORTS_FOLDER.glob("*.xls*"))
+    if not folder_files:
+        st.warning(f"No Excel files found in {REPORTS_FOLDER}")
+        st.stop()
+    st.info(f"Found {len(folder_files)} files in Cash_Reports")
+    uploaded_files = [NamedBytesIO(fp.read_bytes(), fp.name) for fp in folder_files]
+else:
+    uploaded_files = st.file_uploader(
+        "Upload Excel files (Multi-select supported)",
+        type=['xlsx', 'xls'],
+        accept_multiple_files=True,
+    )
 
 if uploaded_files:
     all_data = []
@@ -197,57 +133,266 @@ if uploaded_files:
             all_data.append(df)
 
     if all_data:
-        # Merge all files
         full_df = pd.concat(all_data, ignore_index=True)
 
+        # Deduplication
+        full_df, n_dupes = deduplicate_transactions(full_df)
+        if n_dupes > 0:
+            st.warning(f"Removed {n_dupes} duplicate transaction(s) found across uploaded files.")
+
         # Sort and Classify
-        full_df = full_df.sort_values('Date', ascending=False)
+        full_df = full_df.sort_values('Date', ascending=False).reset_index(drop=True)
         full_df['Month_Year'] = full_df['Date'].dt.to_period('M')
         full_df['Category'] = full_df['Merchant'].apply(lambda x: classify_expense(x, mapping))
 
-        # --- Visual Dashboard ---
+        # Apply date filter
+        if date_filter_enabled:
+            if date_from:
+                full_df = full_df[full_df['Date'] >= pd.Timestamp(date_from)]
+            if date_to:
+                full_df = full_df[full_df['Date'] <= pd.Timestamp(date_to)]
+            if full_df.empty:
+                st.warning("No transactions in the selected date range.")
+                st.stop()
 
-        # Key Metrics
-        total_spent = full_df['Amount'].sum()
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Expenses", f"₪{total_spent:,.2f}")
-        col2.metric("Total Transactions", len(full_df))
-        col3.metric("Active Months", full_df['Month_Year'].nunique())
+        # Month filter
+        available_months = sorted(full_df['Month_Year'].astype(str).unique(), reverse=True)
+        selected_month = st.selectbox("Filter by month", ["All"] + available_months)
+        if selected_month != "All":
+            full_df = full_df[full_df['Month_Year'].astype(str) == selected_month]
 
-        st.divider()
-
-        # Chart by Category
-        st.subheader("Distribution by Category")
-        category_sum = full_df.groupby('Category')['Amount'].sum().sort_values(ascending=False)
-        st.bar_chart(category_sum)
-
-        # Pivot Table (Logic for Excel)
-        pivot_table = full_df.pivot_table(
-            index='Category',
-            columns='Month_Year',
-            values='Amount',
-            aggfunc='sum',
-            fill_value=0
+        # ==========================================
+        # TABS
+        # ==========================================
+        tab_overview, tab_deepdive, tab_transactions = st.tabs(
+            ["Overview", "Deep Dive", "Transactions"]
         )
-        pivot_table['TOTAL'] = pivot_table.sum(axis=1)
-        pivot_table.loc['GRAND TOTAL'] = pivot_table.sum()
 
-        # Raw Data Preview
-        with st.expander("Show Raw Data"):
-            st.dataframe(full_df)
+        # ==========================================
+        # TAB 1 — OVERVIEW
+        # ==========================================
+        with tab_overview:
 
-        st.divider()
+            # Key Metrics
+            total_spent = full_df['Amount'].sum()
+            n_months = max(full_df['Month_Year'].nunique(), 1)
+            avg_per_month = total_spent / n_months
 
-        # Download Button
-        excel_data = generate_excel_bytes(full_df, pivot_table)
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Total Expenses", f"₪{total_spent:,.2f}")
+            col2.metric("Avg / Month", f"₪{avg_per_month:,.2f}")
+            col3.metric("Total Transactions", len(full_df))
+            col4.metric("Active Months", n_months)
 
-        st.download_button(
-            label="📥 Download Formatted Excel Report",
-            data=excel_data,
-            file_name=f'Expenses_Report_{datetime.strftime(datetime.today(), "%d_%m_%Y")}.xlsx',
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary"  # Prominent button
-        )
+            st.divider()
+
+            # Budget Status
+            budgets = load_budgets()
+            if budgets:
+                st.subheader("Budget Status (monthly avg)")
+                category_totals = full_df.groupby('Category')['Amount'].sum()
+                budget_cols = st.columns(min(len(budgets), 4))
+                for i, (cat, limit) in enumerate(budgets.items()):
+                    spent = category_totals.get(cat, 0)
+                    monthly_avg = spent / n_months
+                    pct = min(monthly_avg / limit, 1.0)
+                    with budget_cols[i % len(budget_cols)]:
+                        st.metric(cat, f"₪{monthly_avg:,.0f} / ₪{limit:,.0f} /mo")
+                        st.progress(pct)
+                st.divider()
+
+            # Charts: category bar + monthly trend
+            col_left, col_right = st.columns(2)
+
+            with col_left:
+                st.subheader("Spending by Category")
+                category_sum = full_df.groupby('Category')['Amount'].sum().sort_values(ascending=False)
+                st.bar_chart(category_sum)
+
+            with col_right:
+                st.subheader("Monthly Trend")
+                monthly_trend = (
+                    full_df.groupby(full_df['Month_Year'].astype(str))['Amount']
+                    .sum()
+                    .sort_index()
+                )
+                st.line_chart(monthly_trend)
+
+            st.divider()
+
+            # Top 10 Merchants
+            st.subheader("Top 10 Merchants")
+            top_merchants = (
+                full_df.groupby('Merchant')['Amount']
+                .sum()
+                .nlargest(10)
+                .reset_index()
+                .rename(columns={'Amount': 'Total Spent'})
+            )
+            top_merchants['Total Spent'] = top_merchants['Total Spent'].map(lambda x: f"₪{x:,.2f}")
+            st.dataframe(top_merchants, use_container_width=True, hide_index=True)
+
+        # ==========================================
+        # TAB 2 — DEEP DIVE
+        # ==========================================
+        with tab_deepdive:
+
+            # Month-over-Month Change
+            st.subheader("Month-over-Month Change")
+            mom = (
+                full_df.groupby(full_df['Month_Year'].astype(str))['Amount']
+                .sum()
+                .sort_index()
+                .reset_index()
+                .rename(columns={'Month_Year': 'Month', 'Amount': 'Total'})
+            )
+            mom['Prev'] = mom['Total'].shift(1)
+            mom['Change (₪)'] = mom['Total'] - mom['Prev']
+            mom['Change (%)'] = ((mom['Change (₪)'] / mom['Prev']) * 100).round(1)
+            mom['Total'] = mom['Total'].map(lambda x: f"₪{x:,.2f}")
+            mom['Change (₪)'] = mom['Change (₪)'].map(lambda x: f"+₪{x:,.2f}" if x > 0 else f"₪{x:,.2f}" if pd.notna(x) else "—")
+            mom['Change (%)'] = mom['Change (%)'].map(lambda x: f"+{x}%" if x > 0 else f"{x}%" if pd.notna(x) else "—")
+            mom = mom.drop(columns=['Prev'])
+            st.dataframe(mom, use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # Cumulative Spending
+            st.subheader("Cumulative Spending Over Time")
+            cumulative = (
+                full_df.dropna(subset=['Date'])
+                .sort_values('Date')
+                .assign(Cumulative=lambda d: d['Amount'].cumsum())
+                [['Date', 'Cumulative']]
+                .set_index('Date')
+            )
+            st.line_chart(cumulative)
+
+            st.divider()
+
+            # Spending by Day of Week
+            st.subheader("Spending by Day of Week")
+            dow_order = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+            full_df['DayOfWeek'] = full_df['Date'].dt.day_name()
+            dow = (
+                full_df.groupby('DayOfWeek')['Amount']
+                .sum()
+                .reindex(dow_order)
+                .dropna()
+            )
+            st.bar_chart(dow)
+
+            st.divider()
+
+            # Average Transaction Size by Category
+            st.subheader("Average Transaction Size by Category")
+            avg_tx = (
+                full_df.groupby('Category')['Amount']
+                .agg(Transactions='count', Average='mean', Total='sum')
+                .sort_values('Total', ascending=False)
+                .reset_index()
+            )
+            avg_tx['Average'] = avg_tx['Average'].map(lambda x: f"₪{x:,.2f}")
+            avg_tx['Total'] = avg_tx['Total'].map(lambda x: f"₪{x:,.2f}")
+            st.dataframe(avg_tx, use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # Category Drill-Down
+            st.subheader("Category Drill-Down")
+            all_categories = sorted(full_df['Category'].unique().tolist())
+            selected_cat = st.selectbox("Select a category", all_categories)
+            cat_df = full_df[full_df['Category'] == selected_cat]
+
+            dc1, dc2, dc3 = st.columns(3)
+            dc1.metric("Total Spent", f"₪{cat_df['Amount'].sum():,.2f}")
+            dc2.metric("Transactions", len(cat_df))
+            dc3.metric("Avg Transaction", f"₪{cat_df['Amount'].mean():,.2f}")
+
+            col_d1, col_d2 = st.columns(2)
+
+            with col_d1:
+                st.markdown("**Monthly Breakdown**")
+                cat_monthly = (
+                    cat_df.groupby(cat_df['Month_Year'].astype(str))['Amount']
+                    .sum()
+                    .sort_index()
+                )
+                st.bar_chart(cat_monthly)
+
+            with col_d2:
+                st.markdown("**Top Merchants in this Category**")
+                cat_merchants = (
+                    cat_df.groupby('Merchant')['Amount']
+                    .sum()
+                    .nlargest(8)
+                    .reset_index()
+                )
+                cat_merchants['Amount'] = cat_merchants['Amount'].map(lambda x: f"₪{x:,.2f}")
+                st.dataframe(cat_merchants, use_container_width=True, hide_index=True)
+
+        # ==========================================
+        # TAB 3 — TRANSACTIONS
+        # ==========================================
+        with tab_transactions:
+
+            st.subheader("Review & Re-categorize Transactions")
+            filter_cat = st.selectbox(
+                "Filter by category",
+                ["All"] + sorted(full_df['Category'].unique().tolist()),
+                key="tx_filter"
+            )
+            display_df = full_df if filter_cat == "All" else full_df[full_df['Category'] == filter_cat]
+
+            category_options = list(mapping.keys())
+            edited_df = st.data_editor(
+                display_df[['Date', 'Merchant', 'Amount', 'Category', 'Source_File']].reset_index(drop=True),
+                column_config={
+                    "Category": st.column_config.SelectboxColumn(
+                        "Category",
+                        options=category_options,
+                        required=True,
+                    )
+                },
+                use_container_width=True,
+                hide_index=True,
+                key="category_editor"
+            )
+            # Sync edits back
+            full_df.loc[display_df.index, 'Category'] = edited_df['Category'].values
+
+            # Uncategorized review
+            uncategorized = full_df[full_df['Category'] == 'Uncategorized']
+            if not uncategorized.empty:
+                with st.expander(f"⚠️ {len(uncategorized)} Uncategorized Transactions — click to review"):
+                    st.dataframe(
+                        uncategorized[['Date', 'Merchant', 'Amount', 'Source_File']],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+            st.divider()
+
+            # Pivot Table & Download
+            pivot_table = full_df.pivot_table(
+                index='Category',
+                columns='Month_Year',
+                values='Amount',
+                aggfunc='sum',
+                fill_value=0
+            )
+            pivot_table['TOTAL'] = pivot_table.sum(axis=1)
+            pivot_table.loc['GRAND TOTAL'] = pivot_table.sum()
+
+            excel_data = generate_excel_bytes(full_df, pivot_table)
+
+            st.download_button(
+                label="📥 Download Formatted Excel Report",
+                data=excel_data,
+                file_name=f'Expenses_Report_{datetime.strftime(datetime.today(), "%d_%m_%Y")}.xlsx',
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
 
     else:
         st.warning("No transactions found in the uploaded files.")
