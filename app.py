@@ -24,14 +24,19 @@ from core.excel import generate_excel_bytes
 st.set_page_config(page_title="Personal Budget Analyzer", page_icon="💰", layout="wide")
 
 # Password protection
+
 def check_password():
+    try:
+        app_password = st.secrets["APP_PASSWORD"]
+    except Exception:
+        return  # No secrets file — skip password locally
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
     if not st.session_state.authenticated:
         st.title("Login")
         password = st.text_input("Password", type="password")
         if st.button("Enter"):
-            if password == st.secrets["APP_PASSWORD"]:
+            if password == app_password:
                 st.session_state.authenticated = True
                 st.rerun()
             else:
@@ -215,8 +220,9 @@ if uploaded_files:
         # ==========================================
         # TABS
         # ==========================================
-        tab_overview, tab_deepdive, tab_transactions = st.tabs(
-            ["Overview", "Deep Dive", "Transactions"]
+        uncategorized_count = (full_df['Category'] == 'Uncategorized').sum()
+        tab_overview, tab_deepdive, tab_transactions, tab_categorize = st.tabs(
+            ["Overview", "Deep Dive", "Transactions", f"Categorize ({uncategorized_count} left)"]
         )
 
         # ==========================================
@@ -444,6 +450,59 @@ if uploaded_files:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary"
             )
+
+        # ==========================================
+        # TAB 4 — CATEGORIZE
+        # ==========================================
+        with tab_categorize:
+            uncategorized_merchants = (
+                full_df[full_df['Category'] == 'Uncategorized']['Merchant']
+                .dropna()
+                .unique()
+                .tolist()
+            )
+
+            if not uncategorized_merchants:
+                st.success("All transactions are categorized!")
+            else:
+                st.subheader(f"{len(uncategorized_merchants)} uncategorized stores")
+                st.caption("Assign a category to each store and click Save All.")
+
+                category_options = [c for c in mapping.keys() if c != "Uncategorized"] + ["+ New category"]
+
+                assignments = {}
+                for merchant in sorted(uncategorized_merchants):
+                    count = (full_df['Merchant'] == merchant).sum()
+                    total = full_df[full_df['Merchant'] == merchant]['Amount'].sum()
+                    col_m, col_c = st.columns([2, 2])
+                    with col_m:
+                        st.markdown(f"**{merchant}**  \n{count} transactions · ₪{total:,.0f}")
+                    with col_c:
+                        choice = st.selectbox("", category_options, key=f"cat_{merchant}", label_visibility="collapsed")
+                        if choice == "+ New category":
+                            choice = st.text_input("New category name", key=f"new_{merchant}")
+                        assignments[merchant] = choice
+
+                if st.button("Save All", type="primary"):
+                    try:
+                        with open('categories.json', 'r', encoding='utf-8') as f:
+                            cat_data = json.load(f)
+                    except FileNotFoundError:
+                        cat_data = {**DEFAULT_CATEGORY_MAPPING}
+
+                    for merchant, category in assignments.items():
+                        if category and category != "+ New category":
+                            if category not in cat_data:
+                                cat_data[category] = []
+                            if merchant not in cat_data[category]:
+                                cat_data[category].append(merchant)
+
+                    ok, err = save_categories_json(json.dumps(cat_data, ensure_ascii=False, indent=2))
+                    if ok:
+                        st.success("Saved! Reload the page to apply.")
+                        load_category_mapping.clear()
+                    else:
+                        st.error(f"Error: {err}")
 
     else:
         st.warning("No transactions found in the uploaded files.")
